@@ -1,7 +1,0 @@
-vltrsrc-RC / voluntarios
----------------------------------
-Code ▼
-Add file ▼
-Go to file
----------------------------------
-main.py

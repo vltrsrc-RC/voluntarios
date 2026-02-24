@@ -9,4 +9,4 @@ COPY . .
 
 ENV PORT=8080
 
-CMD ["functions-framework", "--target=converter_xlsx_para_csv", "--host=0.0.0.0", "--port=8080"]
+CMD ["functions-framework", "--target=converter_xlsx_para_bigquery", "--host=0.0.0.0", "--port=8080"]

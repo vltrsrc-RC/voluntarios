@@ -35,7 +35,7 @@ def converter_xlsx_para_bigquery(cloud_event):
     # 🔥 Aqui enviamos para BigQuery
     client = bigquery.Client()
 
-    table_id = "SEU_PROJETO.Voluntarios_RC.horas"
+    table_id = "vltrs-rc.Voluntarios_RC.horas"
 
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_APPEND",  # adiciona novos registros

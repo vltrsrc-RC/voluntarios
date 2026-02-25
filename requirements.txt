@@ -2,5 +2,6 @@ functions-framework
 google-cloud-storage
 google-cloud-bigquery
 pandas
+pandas-gbq
 openpyxl
 pyarrow

@@ -1,53 +1,46 @@
 import functions_framework
-from google.cloud import storage
-from google.cloud import bigquery
+from google.cloud import storage, bigquery
 import pandas as pd
 import io
 from urllib.parse import unquote
 
-@functions_framework.cloud_event
-def converter_xlsx_para_bigquery(cloud_event):
+@functions_framework.http
+def converter_xlsx_para_bigquery(request):
+    # O GCS envia um JSON via POST quando o arquivo é criado
+    data = request.get_json(silent=True)
+    
+    if not data:
+        return "Nenhum dado recebido", 400
 
-    data = cloud_event.data
-    bucket_name = data["bucket"]
-    file_name = unquote(data["name"])
+    bucket_name = data.get("bucket")
+    file_name = unquote(data.get("name"))
 
-    if not file_name.startswith("entrada/horas/"):
-        return
+    print(f"Recebido: {file_name} no bucket {bucket_name}")
 
-    if not file_name.endswith(".xlsx"):
-        return
+    # Filtros de segurança
+    if not file_name.startswith("entrada/horas/") or not file_name.endswith(".xlsx"):
+        return "Ignorado: Caminho ou formato inválido", 200
 
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(file_name)
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(file_name)
+        content = blob.download_as_bytes()
 
-    content = blob.download_as_bytes()
+        # Lendo o Excel (ajustado para o seu print: Listagem de Horas)
+        df = pd.read_excel(io.BytesIO(content), sheet_name="Listagem de Horas", skiprows=11)
+        df = df.dropna(how="all")
 
-    df = pd.read_excel(
-        io.BytesIO(content),
-        sheet_name="Listagem de Horas",
-        skiprows=11
-    )
+        # Configuração BigQuery
+        client = bigquery.Client()
+        table_id = "vltrs-rc.Voluntarios_RC.horas"
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND", autodetect=True)
 
-    df = df.dropna(how="all")
+        job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
+        job.result()
 
-    # 🔥 Aqui enviamos para BigQuery
-    client = bigquery.Client()
+        return f"Sucesso: {file_name} processado.", 200
 
-    table_id = "vltrs-rc.Voluntarios_RC.horas"
-
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_APPEND",  # adiciona novos registros
-        autodetect=True
-    )
-
-    job = client.load_table_from_dataframe(
-        df,
-        table_id,
-        job_config=job_config
-    )
-
-    job.result()
-
-    print(f"Dados enviados para BigQuery: {table_id}")
+    except Exception as e:
+        print(f"Erro: {str(e)}")
+        return f"Erro interno: {str(e)}", 500

@@ -3,18 +3,17 @@ from google.cloud import storage
 from google.cloud import bigquery
 import pandas as pd
 import io
+import re
 from urllib.parse import unquote
 
 def converter_hora_para_decimal(valor_hora):
-    """Transforma '01:30' em 1.5 para o BigQuery aceitar como FLOAT"""
+    """Converte '01:30' para 1.5"""
     try:
         if pd.isna(valor_hora) or valor_hora == "":
             return 0.0
-        # Se já for número, apenas retorna
         if isinstance(valor_hora, (int, float)):
             return float(valor_hora)
         
-        # Se for string formato HH:MM
         partes = str(valor_hora).strip().split(':')
         if len(partes) >= 2:
             horas = int(partes[0])
@@ -28,84 +27,91 @@ def converter_hora_para_decimal(valor_hora):
 def converter_xlsx_para_bigquery(request):
     request_json = request.get_json(silent=True)
     if not request_json:
-        return "Sem dados no trigger", 200
+        return "OK", 200
 
     try:
         bucket_name = request_json.get("bucket")
         file_name = unquote(request_json.get("name"))
 
-        # Filtro de pasta conforme sua estrutura
         if not (file_name.startswith("entrada/horas/") and file_name.endswith(".xlsx")):
-            return "Arquivo ignorado (fora da pasta entrada/horas/)", 200
+            return "Ignorado", 200
 
-        print(f"--- Iniciando processamento: {file_name} ---")
-
-        # Download do arquivo do GCS
+        # Download
         storage_client = storage.Client()
         blob = storage_client.bucket(bucket_name).blob(file_name)
         content = blob.download_as_bytes()
 
-        # Leitura do Excel: Pula 11 linhas, cabeçalho está na 12 (index 11 do pandas)
-        df = pd.read_excel(
-            io.BytesIO(content), 
-            sheet_name="Listagem de Horas", 
-            skiprows=11, 
-            engine='openpyxl'
-        )
+        # Leitura do Excel (Cabeçalho na linha 12)
+        df = pd.read_excel(io.BytesIO(content), sheet_name="Listagem de Horas", skiprows=11, engine='openpyxl')
 
-        # 1. Limpeza de espaços nos nomes das colunas do Excel
+        # 1. Limpeza rigorosa dos nomes das colunas vindas do Excel
         df.columns = [str(c).strip() for c in df.columns]
 
-        # 2. MAPEAMENTO DE COLUNAS (DE: Excel -> PARA: BigQuery)
-        # Ajuste o lado esquerdo para bater EXATAMENTE com a imagem 2 que você enviou
+        # 2. DICIONÁRIO DE MAPEAMENTO (Excel -> BigQuery)
+        # O lado esquerdo deve ser idêntico ao que está na imagem 2 do seu Excel
         mapeamento = {
-            'Voluntário': 'nome',
-            'Data': 'data',
-            'Horas': 'horas',
-            'Livro': 'livro',
             'Localidade': 'localidade',
+            'Livro': 'livro',
+            'Voluntário': 'voluntario',
+            'Data Nasc.': 'data_nascimento',
             'Função': 'funcoes',
+            'Data': 'data',
             'Início': 'inicio',
             'Fim': 'fim',
+            'Horas': 'horas',
             'Valor': 'valor'
         }
-        
+
+        # Renomeia as colunas
         df = df.rename(columns=mapeamento)
 
-        # 3. Tratamento de Dados
-        # Converter Data: de 01/01/16 para 2016-01-01
-        if 'data' in df.columns:
-            df['data'] = pd.to_datetime(df['data'], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')
+        # 3. Tratamento de Dados Específicos
+        # Datas (Trata tanto a data do trabalho quanto a de nascimento)
+        for col_data in ['data', 'data_nascimento']:
+            if col_data in df.columns:
+                df[col_data] = pd.to_datetime(df[col_data], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')
         
-        # Converter Horas: de 01:30 para 1.5
+        # Horas (HH:MM -> Decimal)
         if 'horas' in df.columns:
             df['horas'] = df['horas'].apply(converter_hora_para_decimal)
 
-        # 4. Seleção de Colunas (Somente o que existe na tabela 'horas' do seu BigQuery)
-        colunas_validas = ['nome', 'data', 'horas', 'livro', 'localidade', 'funcoes', 'inicio', 'fim', 'valor']
-        df_final = df[[c for c in colunas_validas if c in df.columns]].copy()
+        # Campos de Hora (Início/Fim) - BigQuery espera STRING ou TIME, garantimos String HH:MM
+        for col_time in ['inicio', 'fim']:
+            if col_time in df.columns:
+                df[col_time] = df[col_time].astype(str).str.strip()
 
-        # Remove linhas onde o nome está nulo (sujeira do Excel)
+        # 4. Criação de colunas que existem no BQ mas não no Excel (como nome_normalizado)
+        if 'nome' in df.columns:
+            df['nome_normalizado'] = df['nome'].str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8').str.upper()
+
+        # 5. Filtragem Final: Manter apenas o que o BigQuery aceita
+        colunas_destino = [
+            'localidade', 'livro', 'nome', 'nome_normalizado', 
+            'data_nascimento', 'funcoes', 'data', 'inicio', 'fim', 'horas', 'valor'
+        ]
+        
+        # Filtra e remove linhas onde o nome é nulo (sujeira do rodapé do Excel)
+        df_final = df[[c for c in colunas_destino if c in df.columns]].copy()
         df_final = df_final.dropna(subset=['nome'])
 
-        # 5. Envio para o BigQuery
+        # 6. Envio para o BigQuery
         client = bigquery.Client()
-        table_id = "vltrs-rc.voluntarios.horas" # Dataset 'voluntarios' conforme imagem 1
+        table_id = "vltrs-rc.voluntarios.horas"
 
         registros = df_final.to_dict(orient='records')
         
         if not registros:
-            return "Nenhum registro válido encontrado no Excel", 200
+            return "Nenhum dado válido", 200
 
         errors = client.insert_rows_json(table_id, registros)
 
         if errors == []:
-            print(f"✅ SUCESSO: {len(registros)} linhas inseridas em {table_id}")
-            return "Processamento concluído", 200
+            print(f"✅ SUCESSO: {len(registros)} linhas em {table_id}")
+            return "Sucesso", 200
         else:
-            print(f"❌ ERRO BigQuery: {errors}")
-            return f"Erro na inserção: {errors}", 500
+            print(f"❌ ERRO BQ: {errors}")
+            return str(errors), 500
 
     except Exception as e:
         print(f"❌ ERRO CRÍTICO: {str(e)}")
-        return f"Erro: {str(e)}", 500
+        return str(e), 500

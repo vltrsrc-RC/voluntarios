@@ -7,53 +7,44 @@ from datetime import datetime
 from urllib.parse import unquote
 
 def ajustar_seculo(dt):
-    """Corrige anos interpretados erroneamente (ex: 64 para 1964)"""
-    if pd.isna(dt): 
-        return None
+    """Corrige anos interpretados como 2064 para 1964"""
+    if pd.isna(dt): return None
     if dt.year > datetime.now().year:
         return dt.replace(year=dt.year - 100)
     return dt
 
 def converter_para_decimal(valor):
-    """Converte valores do Excel para float, tratando HH:MM e números puros"""
+    """Converte valores do Excel para float (01:30 -> 1.5). Retorna 0.0 se vazio"""
     try:
         if pd.isna(valor) or str(valor).strip() == "" or str(valor).lower() == 'nan': 
-            return 0.0 # Se vazio, retorna 0.0 (Garante que 'funcao' não seja null)
-        
-        if isinstance(valor, (int, float)):
-            return float(valor)
-            
+            return 0.0
+        if isinstance(valor, (int, float)): return float(valor)
         str_val = str(valor).strip().replace(',', '.')
-        
         if ':' in str_val:
             partes = str_val.split(':')
             return round(int(partes[0]) + (int(partes[1]) / 60), 2)
-            
         return float(str_val)
     except:
         return 0.0
 
-def formatar_hh_mm_bq(valor):
-    """Garante o formato HH:MM:00 exigido pelo tipo TIME do BigQuery. Trata 0.0 como 00:00:00"""
+def formatar_para_string_hh_mm(valor):
+    """Formata apenas como HH:MM para colunas STRING"""
     try:
-        if pd.isna(valor) or str(valor).strip() == "" or str(valor).lower() == 'nan' or valor == 0:
-            return "00:00:00" # Transforma 0 ou vazio em horário zerado
-        
+        if pd.isna(valor) or str(valor).strip() == "" or str(valor).lower() == 'nan':
+            return "00:00"
         t = str(valor).strip()
+        if ' ' in t: t = t.split(' ')[-1] # Remove data se houver
         partes = t.split(':')
         if len(partes) >= 2:
-            hh = partes[0].zfill(2)
-            mm = partes[1].zfill(2)
-            return f"{hh}:{mm}:00"
-        return "00:00:00"
+            return f"{partes[0].zfill(2)}:{partes[1].zfill(2)}"
+        return "00:00"
     except:
-        return "00:00:00"
+        return "00:00"
 
 @functions_framework.http
 def converter_xlsx_para_bigquery(request):
     request_json = request.get_json(silent=True)
-    if not request_json: 
-        return "OK", 200
+    if not request_json: return "OK", 200
 
     try:
         bucket_name = request_json.get("bucket")
@@ -65,37 +56,34 @@ def converter_xlsx_para_bigquery(request):
         storage_client = storage.Client()
         content = storage_client.bucket(bucket_name).blob(file_name).download_as_bytes()
 
-        # Leitura: pula 12 linhas (dados iniciam na 13)
+        # Lê ignorando as 12 linhas iniciais
         df = pd.read_excel(io.BytesIO(content), sheet_name="Listagem de Horas", skiprows=12, header=None, engine='openpyxl')
 
-        # Limpeza: remove linhas sem voluntário (Coluna H / Índice 7)
+        # Remove linhas sem voluntário
         df = df.dropna(subset=[7])
         df = df[df[7].astype(str).str.lower() != 'nan']
 
         df_stg = pd.DataFrame()
-        
         # Mapeamento de Colunas
-        df_stg['localidade'] = df[0].astype(str).str.strip()        # A
-        df_stg['livro'] = df[2].astype(str).str.strip()             # C
-        df_stg['voluntario'] = df[7].astype(str).str.strip()        # H
-        df_stg['cpf'] = df[8].astype(str).str.strip()               # I
+        df_stg['localidade'] = df[0].astype(str).str.strip()
+        df_stg['livro'] = df[2].astype(str).str.strip()
+        df_stg['voluntario'] = df[7].astype(str).str.strip()
+        df_stg['cpf'] = df[8].astype(str).str.strip()
         
-        # Datas
-        data_nasc_dt = pd.to_datetime(df[9], dayfirst=True, errors='coerce')
-        df_stg['data_nascimento'] = data_nasc_dt.apply(ajustar_seculo).dt.strftime('%Y-%m-%d')
+        # Datas (DATE)
+        df_stg['data_nascimento'] = pd.to_datetime(df[9], dayfirst=True, errors='coerce').apply(ajustar_seculo).dt.strftime('%Y-%m-%d')
         df_stg['data'] = pd.to_datetime(df[12], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')
         
-        # Números (Trata vazios como 0.0)
-        df_stg['funcao'] = df[11].apply(converter_para_decimal)     # L
-        df_stg['horas'] = df[18].apply(converter_para_decimal)      # S
-        df_stg['valor'] = df[20].apply(converter_para_decimal)      # U
+        # Horários (STRING)
+        df_stg['inicio'] = df[14].apply(formatar_para_string_hh_mm)
+        df_stg['fim'] = df[17].apply(formatar_para_string_hh_mm)
+        
+        # Números (FLOAT64)
+        df_stg['funcao'] = df[11].apply(converter_para_decimal)
+        df_stg['horas'] = df[18].apply(converter_para_decimal)
+        df_stg['horas_descanso'] = df[19].apply(converter_para_decimal)
+        df_stg['valor'] = df[20].apply(converter_para_decimal)
 
-        # Horários (Trata vazios como 00:00:00)
-        df_stg['inicio'] = df[14].apply(formatar_hh_mm_bq)          # O
-        df_stg['fim'] = df[17].apply(formatar_hh_mm_bq)             # R
-        df_stg['horas_descanso'] = df[19].apply(formatar_hh_mm_bq)  # T
-
-        # Envio para BigQuery
         client = bigquery.Client()
         table_id = "vltrs-rc.voluntarios.STG_Listagem_Horas"
         

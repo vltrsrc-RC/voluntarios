@@ -8,8 +8,10 @@ from urllib.parse import unquote
 def converter_para_decimal(valor):
     """Trata formatos de hora HH:MM ou strings numéricas para float decimal"""
     try:
-        if pd.isna(valor) or str(valor).strip() == "": return 0.0
-        if isinstance(valor, (int, float)): return float(valor)
+        if pd.isna(valor) or str(valor).strip() == "": 
+            return 0.0
+        if isinstance(valor, (int, float)): 
+            return float(valor)
         str_val = str(valor).strip()
         if ':' in str_val:
             partes = str_val.split(':')
@@ -22,62 +24,83 @@ def converter_para_decimal(valor):
 @functions_framework.http
 def converter_xlsx_para_bigquery(request):
     request_json = request.get_json(silent=True)
-    if not request_json: return "OK", 200
+    if not request_json: 
+        return "OK", 200
 
     try:
         bucket_name = request_json.get("bucket")
         file_name = unquote(request_json.get("name"))
 
+        # Filtro de pasta e extensão
         if not (file_name.startswith("entrada/horas/") and file_name.endswith(".xlsx")):
             return "Arquivo ignorado", 200
 
+        print(f"--- Iniciando Processamento STG: {file_name} ---")
+
+        # Download do arquivo
         storage_client = storage.Client()
         content = storage_client.bucket(bucket_name).blob(file_name).download_as_bytes()
 
-        # skiprows=12: ignora as 11 linhas iniciais + a linha 12 do cabeçalho.
-        # header=None: utiliza índices numéricos (0, 1, 2...) para as colunas.
-        df = pd.read_excel(io.BytesIO(content), sheet_name="Listagem de Horas", skiprows=12, header=None, engine='openpyxl')
+        # skiprows=12: ignora as 11 linhas iniciais + linha 12 do cabeçalho original.
+        # header=None: as colunas serão acessadas por números (A=0, B=1...)
+        df = pd.read_excel(
+            io.BytesIO(content), 
+            sheet_name="Listagem de Horas", 
+            skiprows=12, 
+            header=None, 
+            engine='openpyxl'
+        )
 
+        # 1. REMOÇÃO DE LINHAS EM BRANCO
+        # Remove linhas onde as colunas essenciais (como Voluntário na Coluna H/índice 7) estão vazias
+        df = df.dropna(subset=[7]) 
+        
+        # Filtra strings que podem ser lidas como 'nan' pelo pandas
+        df = df[df[7].astype(str).str.lower() != 'nan']
+        df = df[df[7].astype(str).str.strip() != '']
+
+        # 2. MONTAGEM DO DATAFRAME PARA A STG
         df_stg = pd.DataFrame()
         
-        # Mapeamento por Índice (Baseado na estrutura A-U do seu Excel)
+        # Mapeamento por Posição (Excel A-U)
         df_stg['localidade'] = df[0].astype(str).str.strip()        # Coluna A
         df_stg['livro'] = df[2].astype(str).str.strip()             # Coluna C
         df_stg['voluntario'] = df[7].astype(str).str.strip()        # Coluna H
         df_stg['cpf'] = df[8].astype(str).str.strip()               # Coluna I
         
-        # Validação de Datas: Converte DD/MM/YY para YYYY-MM-DD
-        # O parâmetro dayfirst=True é essencial para o formato brasileiro
+        # Datas: Conversão para YYYY-MM-DD
         df_stg['data_nascimento'] = pd.to_datetime(df[9], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d') # Coluna J
         df_stg['data'] = pd.to_datetime(df[12], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')            # Coluna M
         
-        # Números e Cálculos
+        # Números e Horas Decimais
         df_stg['funcao'] = df[11].apply(converter_para_decimal)     # Coluna L
         df_stg['horas'] = df[18].apply(converter_para_decimal)      # Coluna S
         df_stg['horas_descanso'] = df[19].apply(converter_para_decimal) # Coluna T
         df_stg['valor'] = df[20].apply(converter_para_decimal)      # Coluna U
 
-        # Horários (Mantidos como String para referência visual de Início/Fim)
+        # Horários em String (Início/Fim)
         df_stg['inicio'] = df[14].astype(str).str.strip()           # Coluna O
         df_stg['fim'] = df[17].astype(str).str.strip()              # Coluna R
 
-        # Limpeza de linhas vazias ou de rodapé
-        df_stg = df_stg[df_stg['voluntario'].notna() & (df_stg['voluntario'] != 'nan')]
-
-        # Inserção no BigQuery
+        # 3. ENVIO PARA BIGQUERY
         client = bigquery.Client()
         table_id = "vltrs-rc.voluntarios.STG_Listagem_Horas"
         
         registros = df_stg.to_dict(orient='records')
+        
+        if not registros:
+            print("Nenhum dado válido após a limpeza de linhas em branco.")
+            return "Excel Vazio", 200
+
         errors = client.insert_rows_json(table_id, registros)
 
         if errors == []:
-            print(f"✅ Sucesso: {len(registros)} linhas na STG.")
-            return "Sucesso", 200
+            print(f"✅ SUCESSO: {len(registros)} linhas inseridas na STG.")
+            return "Processamento concluído", 200
         else:
-            print(f"❌ Erros de inserção: {errors}")
+            print(f"❌ Erros no BigQuery: {errors}")
             return f"Erro BQ: {errors}", 500
 
     except Exception as e:
-        print(f"❌ Erro Geral: {str(e)}")
-        return f"Erro Geral: {str(e)}", 500
+        print(f"❌ Erro Crítico: {str(e)}")
+        return f"Erro: {str(e)}", 500

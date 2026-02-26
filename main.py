@@ -3,10 +3,20 @@ from google.cloud import storage
 from google.cloud import bigquery
 import pandas as pd
 import io
+from datetime import datetime
 from urllib.parse import unquote
 
+def ajustar_seculo(dt):
+    """Corrige anos interpretados como futuro (ex: 2064 para 1964)"""
+    if pd.isna(dt):
+        return None
+    # Se o ano for maior que o atual, subtrai 100 anos
+    if dt.year > datetime.now().year:
+        return dt.replace(year=dt.year - 100)
+    return dt
+
 def converter_para_decimal(valor):
-    """Trata formatos de hora HH:MM ou strings numéricas para float decimal"""
+    """Converte HH:MM para float (ex: 01:30 -> 1.5)"""
     try:
         if pd.isna(valor) or str(valor).strip() == "": 
             return 0.0
@@ -15,7 +25,6 @@ def converter_para_decimal(valor):
         str_val = str(valor).strip()
         if ':' in str_val:
             partes = str_val.split(':')
-            # Converte HH:MM para valor decimal (ex: 01:30 -> 1.5)
             return round(int(partes[0]) + (int(partes[1]) / 60), 2)
         return float(str_val.replace(',', '.'))
     except:
@@ -31,76 +40,57 @@ def converter_xlsx_para_bigquery(request):
         bucket_name = request_json.get("bucket")
         file_name = unquote(request_json.get("name"))
 
-        # Filtro de pasta e extensão
         if not (file_name.startswith("entrada/horas/") and file_name.endswith(".xlsx")):
             return "Arquivo ignorado", 200
 
-        print(f"--- Iniciando Processamento STG: {file_name} ---")
-
-        # Download do arquivo
         storage_client = storage.Client()
         content = storage_client.bucket(bucket_name).blob(file_name).download_as_bytes()
 
-        # skiprows=12: ignora as 11 linhas iniciais + linha 12 do cabeçalho original.
-        # header=None: as colunas serão acessadas por números (A=0, B=1...)
-        df = pd.read_excel(
-            io.BytesIO(content), 
-            sheet_name="Listagem de Horas", 
-            skiprows=12, 
-            header=None, 
-            engine='openpyxl'
-        )
+        # Leitura a partir da linha 13 (skiprows=12)
+        df = pd.read_excel(io.BytesIO(content), sheet_name="Listagem de Horas", skiprows=12, header=None, engine='openpyxl')
 
-        # 1. REMOÇÃO DE LINHAS EM BRANCO
-        # Remove linhas onde as colunas essenciais (como Voluntário na Coluna H/índice 7) estão vazias
-        df = df.dropna(subset=[7]) 
-        
-        # Filtra strings que podem ser lidas como 'nan' pelo pandas
+        # Limpeza de linhas em branco baseada na coluna do voluntário (H=7)
+        df = df.dropna(subset=[7])
         df = df[df[7].astype(str).str.lower() != 'nan']
-        df = df[df[7].astype(str).str.strip() != '']
 
-        # 2. MONTAGEM DO DATAFRAME PARA A STG
         df_stg = pd.DataFrame()
         
-        # Mapeamento por Posição (Excel A-U)
-        df_stg['localidade'] = df[0].astype(str).str.strip()        # Coluna A
-        df_stg['livro'] = df[2].astype(str).str.strip()             # Coluna C
-        df_stg['voluntario'] = df[7].astype(str).str.strip()        # Coluna H
-        df_stg['cpf'] = df[8].astype(str).str.strip()               # Coluna I
+        # Mapeamento de texto
+        df_stg['localidade'] = df[0].astype(str).str.strip()
+        df_stg['livro'] = df[2].astype(str).str.strip()
+        df_stg['voluntario'] = df[7].astype(str).str.strip()
+        df_stg['cpf'] = df[8].astype(str).str.strip()
         
-        # Datas: Conversão para YYYY-MM-DD
-        df_stg['data_nascimento'] = pd.to_datetime(df[9], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d') # Coluna J
-        df_stg['data'] = pd.to_datetime(df[12], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')            # Coluna M
+        # CORREÇÃO DE DATAS
+        # 1. Converte para objeto datetime primeiro
+        data_nasc_dt = pd.to_datetime(df[9], dayfirst=True, errors='coerce')
+        data_trabalho_dt = pd.to_datetime(df[12], dayfirst=True, errors='coerce')
+
+        # 2. Aplica ajuste de século (para evitar 2064 em vez de 1964)
+        df_stg['data_nascimento'] = data_nasc_dt.apply(ajustar_seculo).dt.strftime('%Y-%m-%d')
+        df_stg['data'] = data_trabalho_dt.dt.strftime('%Y-%m-%d')
         
-        # Números e Horas Decimais
-        df_stg['funcao'] = df[11].apply(converter_para_decimal)     # Coluna L
-        df_stg['horas'] = df[18].apply(converter_para_decimal)      # Coluna S
-        df_stg['horas_descanso'] = df[19].apply(converter_para_decimal) # Coluna T
-        df_stg['valor'] = df[20].apply(converter_para_decimal)      # Coluna U
+        # CONVERSÃO DE HORAS E VALORES
+        df_stg['funcao'] = df[11].apply(converter_para_decimal)
+        df_stg['horas'] = df[18].apply(converter_para_decimal)      # 01:30 -> 1.5
+        df_stg['horas_descanso'] = df[19].apply(converter_para_decimal) # 00:00 -> 0.0
+        df_stg['valor'] = df[20].apply(converter_para_decimal)
 
-        # Horários em String (Início/Fim)
-        df_stg['inicio'] = df[14].astype(str).str.strip()           # Coluna O
-        df_stg['fim'] = df[17].astype(str).str.strip()              # Coluna R
+        # Início e Fim (String)
+        df_stg['inicio'] = df[14].astype(str).str.strip()
+        df_stg['fim'] = df[17].astype(str).str.strip()
 
-        # 3. ENVIO PARA BIGQUERY
+        # Envio para BigQuery
         client = bigquery.Client()
         table_id = "vltrs-rc.voluntarios.STG_Listagem_Horas"
         
         registros = df_stg.to_dict(orient='records')
-        
-        if not registros:
-            print("Nenhum dado válido após a limpeza de linhas em branco.")
-            return "Excel Vazio", 200
-
         errors = client.insert_rows_json(table_id, registros)
 
         if errors == []:
-            print(f"✅ SUCESSO: {len(registros)} linhas inseridas na STG.")
-            return "Processamento concluído", 200
+            return "Sucesso", 200
         else:
-            print(f"❌ Erros no BigQuery: {errors}")
             return f"Erro BQ: {errors}", 500
 
     except Exception as e:
-        print(f"❌ Erro Crítico: {str(e)}")
         return f"Erro: {str(e)}", 500

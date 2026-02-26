@@ -3,31 +3,25 @@ from google.cloud import storage
 from google.cloud import bigquery
 import pandas as pd
 import io
-import re
 from urllib.parse import unquote
 
-def converter_hora_para_decimal(valor_hora):
-    """Converte '01:30' para 1.5"""
+def converter_para_decimal(valor):
+    """Converte formatos de hora HH:MM ou strings para float"""
     try:
-        if pd.isna(valor_hora) or valor_hora == "":
-            return 0.0
-        if isinstance(valor_hora, (int, float)):
-            return float(valor_hora)
-        
-        partes = str(valor_hora).strip().split(':')
-        if len(partes) >= 2:
-            horas = int(partes[0])
-            minutos = int(partes[1])
-            return round(horas + (minutos / 60), 2)
-        return float(valor_hora)
+        if pd.isna(valor) or valor == "": return 0.0
+        if isinstance(valor, (int, float)): return float(valor)
+        str_val = str(valor).strip()
+        if ':' in str_val:
+            partes = str_val.split(':')
+            return round(int(partes[0]) + (int(partes[1]) / 60), 2)
+        return float(str_val.replace(',', '.'))
     except:
         return 0.0
 
 @functions_framework.http
 def converter_xlsx_para_bigquery(request):
     request_json = request.get_json(silent=True)
-    if not request_json:
-        return "OK", 200
+    if not request_json: return "OK", 200
 
     try:
         bucket_name = request_json.get("bucket")
@@ -36,82 +30,52 @@ def converter_xlsx_para_bigquery(request):
         if not (file_name.startswith("entrada/horas/") and file_name.endswith(".xlsx")):
             return "Ignorado", 200
 
-        # Download
         storage_client = storage.Client()
-        blob = storage_client.bucket(bucket_name).blob(file_name)
-        content = blob.download_as_bytes()
+        content = storage_client.bucket(bucket_name).blob(file_name).download_as_bytes()
 
-        # Leitura do Excel (Cabeçalho na linha 12)
-        df = pd.read_excel(io.BytesIO(content), sheet_name="Listagem de Horas", skiprows=11, engine='openpyxl')
+        # Lê o Excel sem cabeçalho para usar índices numéricos (0, 1, 2...)
+        # skiprows=12 para começar exatamente nos dados (abaixo da linha 12)
+        df = pd.read_excel(io.BytesIO(content), sheet_name="Listagem de Horas", skiprows=12, header=None, engine='openpyxl')
 
-        # 1. Limpeza rigorosa dos nomes das colunas vindas do Excel
-        df.columns = [str(c).strip() for c in df.columns]
-
-        # 2. DICIONÁRIO DE MAPEAMENTO (Excel -> BigQuery)
-        # O lado esquerdo deve ser idêntico ao que está na imagem 2 do seu Excel
-        mapeamento = {
-            'Localidade': 'localidade',
-            'Livro': 'livro',
-            'Voluntário': 'voluntario',
-            'Data Nasc.': 'data_nascimento',
-            'Função': 'funcoes',
-            'Data': 'data',
-            'Início': 'inicio',
-            'Fim': 'fim',
-            'Horas': 'horas',
-            'Valor': 'valor'
-        }
-
-        # Renomeia as colunas
-        df = df.rename(columns=mapeamento)
-
-        # 3. Tratamento de Dados Específicos
-        # Datas (Trata tanto a data do trabalho quanto a de nascimento)
-        for col_data in ['data', 'data_nascimento']:
-            if col_data in df.columns:
-                df[col_data] = pd.to_datetime(df[col_data], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')
+        # MAPEAMENTO POR COLUNA DO EXCEL (A=0, B=1, C=2...)
+        # Criamos um novo DataFrame apenas com o que você pediu
+        df_stg = pd.DataFrame()
+        df_stg['localidade'] = df[0].astype(str)           # Coluna A
+        df_stg['livro'] = df[2].astype(str)                # Coluna C
+        df_stg['voluntario'] = df[7].astype(str)           # Coluna H (Voluntário)
+        df_stg['cpf'] = df[8].astype(str)                  # Coluna I
         
-        # Horas (HH:MM -> Decimal)
-        if 'horas' in df.columns:
-            df['horas'] = df['horas'].apply(converter_hora_para_decimal)
-
-        # Campos de Hora (Início/Fim) - BigQuery espera STRING ou TIME, garantimos String HH:MM
-        for col_time in ['inicio', 'fim']:
-            if col_time in df.columns:
-                df[col_time] = df[col_time].astype(str).str.strip()
-
-        # 4. Criação de colunas que existem no BQ mas não no Excel (como nome_normalizado)
-        if 'nome' in df.columns:
-            df['nome_normalizado'] = df['nome'].str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8').str.upper()
-
-        # 5. Filtragem Final: Manter apenas o que o BigQuery aceita
-        colunas_destino = [
-            'localidade', 'livro', 'nome', 'nome_normalizado', 
-            'data_nascimento', 'funcoes', 'data', 'inicio', 'fim', 'horas', 'valor'
-        ]
+        # Datas (J e M)
+        df_stg['data_nascimento'] = pd.to_datetime(df[9], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')
+        df_stg['data'] = pd.to_datetime(df[12], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')
         
-        # Filtra e remove linhas onde o nome é nulo (sujeira do rodapé do Excel)
-        df_final = df[[c for c in colunas_destino if c in df.columns]].copy()
-        df_final = df_final.dropna(subset=['nome'])
+        # Números e Horas (L, S, T, U)
+        df_stg['funcao'] = df[11].apply(converter_para_decimal)   # Coluna L
+        df_stg['horas'] = df[18].apply(converter_para_decimal)    # Coluna S
+        df_stg['horas_descanso'] = df[19].apply(converter_para_decimal) # Coluna T
+        df_stg['valor'] = df[20].apply(converter_para_decimal)    # Coluna U
 
-        # 6. Envio para o BigQuery
+        # Horários como Texto (O e R)
+        df_stg['inicio'] = df[14].astype(str).str.strip()         # Coluna O
+        df_stg['fim'] = df[17].astype(str).str.strip()            # Coluna R
+
+        # Limpeza: remove linhas onde o nome do voluntário é nulo ou "nan"
+        df_stg = df_stg[df_stg['voluntario'] != 'nan'].dropna(subset=['voluntario'])
+
+        # Envio para BigQuery
         client = bigquery.Client()
-        table_id = "vltrs-rc.voluntarios.horas"
-
-        registros = df_final.to_dict(orient='records')
+        table_id = "vltrs-rc.voluntarios.STG_Listagem_Horas"
         
-        if not registros:
-            return "Nenhum dado válido", 200
-
+        registros = df_stg.to_dict(orient='records')
         errors = client.insert_rows_json(table_id, registros)
 
         if errors == []:
-            print(f"✅ SUCESSO: {len(registros)} linhas em {table_id}")
+            print(f"✅ STG carregada: {len(registros)} linhas.")
             return "Sucesso", 200
         else:
-            print(f"❌ ERRO BQ: {errors}")
+            print(f"❌ Erros BQ: {errors}")
             return str(errors), 500
 
     except Exception as e:
-        print(f"❌ ERRO CRÍTICO: {str(e)}")
+        print(f"❌ Erro: {str(e)}")
         return str(e), 500
